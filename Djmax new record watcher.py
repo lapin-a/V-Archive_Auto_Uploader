@@ -29,12 +29,16 @@ import pygetwindow as gw
 # 창모드 게임 창 제목 (작업 관리자/알트탭에서 보이는 정확한 창 제목으로 맞춰야 합니다)
 GAME_WINDOW_TITLE = "DJMAX RESPECT V"
 
-# "NEW RECORD"가 표시되는 영역을, 게임 창의 좌상단 기준 상대 좌표(오프셋)로 지정
-# 창을 화면 어디로 옮기든 이 오프셋만큼 자동으로 따라갑니다.
-CAPTURE_OFFSET_LEFT = 300
-CAPTURE_OFFSET_TOP = 150
-CAPTURE_WIDTH = 400
-CAPTURE_HEIGHT = 200
+# "NEW RECORD" 뱃지의 "중심점" 위치를, 게임 창 크기에 대한 비율로 지정
+# (좌상단 기준보다 중심점 기준이 창 크기 변화에 더 안정적입니다)
+# 아래 기본값은 850x478 기준 캡처에서 측정한 값입니다 (필요시 재측정해서 조정하세요)
+CAPTURE_CENTER_X_FRAC = 0.4988   # 창 너비 대비 뱃지 중심의 x 비율
+CAPTURE_CENTER_Y_FRAC = 0.8096   # 창 높이 대비 뱃지 중심의 y 비율
+CAPTURE_WIDTH_FRAC = 0.2094      # 창 너비 대비 캡처 폭 비율
+CAPTURE_HEIGHT_FRAC = 0.0418     # 창 높이 대비 캡처 높이 비율
+
+# 뱃지 애니메이션(페이드인 등)을 여유 있게 잡기 위한 여백 비율 (선택, 0이면 여백 없음)
+CAPTURE_MARGIN_FRAC = 0.01
 
 # 매 프레임마다 창 위치를 다시 조회할지 여부.
 # True면 창을 옮겨도 항상 정확하지만 약간의 오버헤드가 있습니다.
@@ -87,12 +91,17 @@ def load_template(path: str) -> np.ndarray:
 
 def get_window_capture_region(
     window_title: str,
-    offset_left: int,
-    offset_top: int,
-    width: int,
-    height: int,
+    center_x_frac: float,
+    center_y_frac: float,
+    width_frac: float,
+    height_frac: float,
+    margin_frac: float = 0.0,
 ) -> dict:
-    """지정한 제목의 창을 찾아, 창 좌상단 기준 상대 좌표로 캡처 영역을 계산합니다."""
+    """지정한 제목의 창을 찾아, 뱃지 중심점의 상대 위치(비율)로 캡처 영역(픽셀)을 계산합니다.
+
+    창 크기가 달라져도 (center_x_frac, center_y_frac)로 표현된 중심점의
+    상대 위치는 그대로 유지된다는 가정하에 동작합니다.
+    """
     windows = gw.getWindowsWithTitle(window_title)
     if not windows:
         raise RuntimeError(
@@ -101,12 +110,25 @@ def get_window_capture_region(
         )
 
     win = windows[0]
-    return {
-        "left": win.left + offset_left,
-        "top": win.top + offset_top,
-        "width": width,
-        "height": height,
-    }
+    win_w, win_h = win.width, win.height
+
+    center_x = win.left + center_x_frac * win_w
+    center_y = win.top + center_y_frac * win_h
+    base_width = width_frac * win_w
+    base_height = height_frac * win_h
+
+    # 여백 적용 (창 크기에 비례해서 상하좌우로 살짝 확장)
+    margin_x = margin_frac * win_w
+    margin_y = margin_frac * win_h
+    half_width = base_width / 2 + margin_x
+    half_height = base_height / 2 + margin_y
+
+    left = int(round(center_x - half_width))
+    top = int(round(center_y - half_height))
+    width = int(round(half_width * 2))
+    height = int(round(half_height * 2))
+
+    return {"left": left, "top": top, "width": width, "height": height}
 
 
 def capture_region(sct: mss.mss, region: dict) -> np.ndarray:
@@ -161,9 +183,9 @@ def send_webhooks(urls: list[str]) -> None:
 
 def main() -> None:
     logger.info("DJMAX NEW RECORD 감시 시작 (Ctrl+C로 종료)")
-    logger.info("대상 창: '%s' / 오프셋: (%d, %d) / 영역 크기: %dx%d",
-                GAME_WINDOW_TITLE, CAPTURE_OFFSET_LEFT, CAPTURE_OFFSET_TOP,
-                CAPTURE_WIDTH, CAPTURE_HEIGHT)
+    logger.info("대상 창: '%s' / 중심점=(%.4f, %.4f) / w=%.4f h=%.4f (margin=%.4f)",
+                GAME_WINDOW_TITLE, CAPTURE_CENTER_X_FRAC, CAPTURE_CENTER_Y_FRAC,
+                CAPTURE_WIDTH_FRAC, CAPTURE_HEIGHT_FRAC, CAPTURE_MARGIN_FRAC)
     logger.info("임계값: %.2f / 주기: %.1fs / 쿨다운: %ds",
                 MATCH_THRESHOLD, CHECK_INTERVAL_SEC, COOLDOWN_SEC)
 
@@ -197,10 +219,11 @@ def main() -> None:
                     try:
                         current_region = get_window_capture_region(
                             GAME_WINDOW_TITLE,
-                            CAPTURE_OFFSET_LEFT,
-                            CAPTURE_OFFSET_TOP,
-                            CAPTURE_WIDTH,
-                            CAPTURE_HEIGHT,
+                            CAPTURE_CENTER_X_FRAC,
+                            CAPTURE_CENTER_Y_FRAC,
+                            CAPTURE_WIDTH_FRAC,
+                            CAPTURE_HEIGHT_FRAC,
+                            CAPTURE_MARGIN_FRAC,
                         )
                         last_window_refresh_at = now
                     except RuntimeError as e:
