@@ -1,15 +1,17 @@
 """
-DJMAX Respect V - NEW RECORD 감지 → Webhook 트리거 스크립트
+DJMAX Respect V - 뱃지 감지 → Webhook 트리거 스크립트
 
 기능:
-  1. 지정한 화면 영역을 주기적으로 캡처
-  2. "NEW RECORD" 템플릿 이미지와 cv2.matchTemplate()으로 유사도 비교
-  3. 임계값 이상이면 Make / n8n Webhook으로 감지 신호(JSON) 전송
-  4. 중복 감지 방지를 위한 쿨다운 적용
-  5. Ctrl+C로 종료
+  1. NEW RECORD / MAX COMBO / PERFECT 세 종류의 뱃지를 각각 독립적으로 감시
+  2. 각 뱃지는 창 크기 대비 "중심점 비율"로 위치를 지정하므로 창 크기가 달라져도 위치를 따라감
+  3. cv2.matchTemplate()으로 뱃지별 템플릿 이미지와 비교
+  4. 뱃지별로 독립적인 쿨다운을 적용해 중복 감지를 방지
+  5. NEW RECORD가 감지된 순간, MAX COMBO/PERFECT 뱃지가 함께 떠 있는지도 확인해서
+     그 결과를 new_record_detected 이벤트의 payload에 플래그로 실어 보냄
+  6. Ctrl+C로 종료
 
 필요 라이브러리:
-  pip install mss opencv-python requests numpy
+  pip install mss opencv-python requests numpy pygetwindow
 """
 
 import time
@@ -29,34 +31,15 @@ import pygetwindow as gw
 # 창모드 게임 창 제목 (작업 관리자/알트탭에서 보이는 정확한 창 제목으로 맞춰야 합니다)
 GAME_WINDOW_TITLE = "DJMAX RESPECT V"
 
-# "NEW RECORD" 뱃지의 "중심점" 위치를, 게임 창 크기에 대한 비율로 지정
-# (좌상단 기준보다 중심점 기준이 창 크기 변화에 더 안정적입니다)
-# 아래 기본값은 850x478 기준 캡처에서 측정한 값입니다 (필요시 재측정해서 조정하세요)
-CAPTURE_CENTER_X_FRAC = 0.4988   # 창 너비 대비 뱃지 중심의 x 비율
-CAPTURE_CENTER_Y_FRAC = 0.8096   # 창 높이 대비 뱃지 중심의 y 비율
-CAPTURE_WIDTH_FRAC = 0.2094      # 창 너비 대비 캡처 폭 비율
-CAPTURE_HEIGHT_FRAC = 0.0418     # 창 높이 대비 캡처 높이 비율
-
-# 뱃지 애니메이션(페이드인 등)을 여유 있게 잡기 위한 여백 비율 (선택, 0이면 여백 없음)
-CAPTURE_MARGIN_FRAC = 0.01
-
 # 매 프레임마다 창 위치를 다시 조회할지 여부.
-# True면 창을 옮겨도 항상 정확하지만 약간의 오버헤드가 있습니다.
-# False면 REFRESH_WINDOW_EVERY_SEC 주기로만 갱신합니다.
 TRACK_WINDOW_EVERY_FRAME = True
 REFRESH_WINDOW_EVERY_SEC = 5
-
-# 비교할 템플릿 이미지 경로 ("NEW RECORD" 뱃지/문구를 미리 캡처해서 저장해두세요)
-TEMPLATE_IMAGE_PATH = "new_record_template.png"
-
-# 템플릿 매칭 유사도 임계값 (0.0 ~ 1.0). 값이 높을수록 엄격하게 판정합니다.
-MATCH_THRESHOLD = 0.8
 
 # 캡처 주기 (초)
 CHECK_INTERVAL_SEC = 1.5
 
-# 중복 감지를 막기 위한 쿨다운 (초). 감지 후 이 시간 동안은 재감지하지 않습니다.
-COOLDOWN_SEC = 12
+# Webhook 요청 타임아웃 (초)
+WEBHOOK_TIMEOUT_SEC = 5
 
 # 감지 시 신호를 전송할 Webhook URL들 (Make / n8n 등, 필요한 만큼 추가/삭제 가능)
 WEBHOOK_URLS = [
@@ -64,8 +47,53 @@ WEBHOOK_URLS = [
     "[n8n Webhook URL을 입력하세요]",
 ]
 
-# Webhook 요청 타임아웃 (초)
-WEBHOOK_TIMEOUT_SEC = 5
+# ----------------------------------------------------------
+# 뱃지별 설정
+# 각 뱃지는 850x478 기준 캡처에서 측정한 "창 크기 대비 비율" 좌표를 사용합니다.
+# 좌표 측정 방식은 draw_region_debug.py(아래 안내 참고)로 검증할 수 있습니다.
+# ----------------------------------------------------------
+
+BADGES = {
+    "new_record": {
+        "event_name": "new_record_detected",
+        "template_path": "templates/new_record_template.png",
+        "center_x_frac": 0.4988,
+        "center_y_frac": 0.8096,
+        "width_frac": 0.2094,
+        "height_frac": 0.0418,
+        "margin_frac": 0.01,
+        "threshold": 0.8,
+        "cooldown_sec": 12,
+        # True면: 이 뱃지가 감지될 때 다른 뱃지들의 "현재 상태"를 함께 확인해서
+        # payload에 플래그로 포함시킵니다 (신기록 + 맥스콤보/퍼펙트 여부 동시 기록용)
+        "check_companions": True,
+    },
+    "max_combo": {
+        "event_name": "max_combo_detected",
+        "template_path": "templates/max_combo_template.png",
+        "center_x_frac": 0.5576,
+        "center_y_frac": 0.4770,
+        "width_frac": 0.0612,
+        "height_frac": 0.0837,
+        "margin_frac": 0.01,
+        "threshold": 0.8,
+        "cooldown_sec": 12,
+        "check_companions": False,
+    },
+    "perfect": {
+        "event_name": "perfect_detected",
+        "template_path": "templates/perfect_template.png",
+        # 실제 PERFECT PLAY 스크린샷에서 측정한 값입니다.
+        "center_x_frac": 0.5312,
+        "center_y_frac": 0.4948,
+        "width_frac": 0.1024,
+        "height_frac": 0.1318,
+        "margin_frac": 0.01,
+        "threshold": 0.8,
+        "cooldown_sec": 12,
+        "check_companions": False,
+    },
+}
 
 # ==========================================================
 # 로깅 설정
@@ -82,10 +110,7 @@ def load_template(path: str) -> np.ndarray:
     """템플릿 이미지를 그레이스케일로 로드합니다."""
     template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if template is None:
-        raise FileNotFoundError(
-            f"템플릿 이미지를 찾을 수 없습니다: {path}. "
-            "TEMPLATE_IMAGE_PATH 설정을 확인하세요."
-        )
+        raise FileNotFoundError(f"템플릿 이미지를 찾을 수 없습니다: {path}")
     return template
 
 
@@ -117,7 +142,6 @@ def get_window_capture_region(
     base_width = width_frac * win_w
     base_height = height_frac * win_h
 
-    # 여백 적용 (창 크기에 비례해서 상하좌우로 살짝 확장)
     margin_x = margin_frac * win_w
     margin_y = margin_frac * win_h
     half_width = base_width / 2 + margin_x
@@ -147,99 +171,141 @@ def capture_region(sct: mss.mss, region: dict) -> np.ndarray:
 
 def match_score(frame_gray: np.ndarray, template_gray: np.ndarray) -> float:
     """템플릿 매칭을 수행하고 최대 유사도 점수를 반환합니다."""
-    # 캡처 영역이 템플릿보다 작으면 매칭할 수 없으므로 방어적으로 처리
     if (
         frame_gray.shape[0] < template_gray.shape[0]
         or frame_gray.shape[1] < template_gray.shape[1]
     ):
-        logger.warning("캡처 영역이 템플릿 이미지보다 작습니다. CAPTURE_REGION을 확인하세요.")
         return 0.0
-
     result = cv2.matchTemplate(frame_gray, template_gray, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(result)
     return max_val
 
 
-def send_webhooks(urls: list[str]) -> None:
+def send_webhook(event_name: str, extra_fields: dict | None = None) -> None:
     """모든 Webhook URL에 감지 신호를 전송합니다."""
     payload = {
-        "event": "new_record_detected",
+        "event": event_name,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         # 곡명 자동 인식이 어려우면 생략하고 워크플로우 쪽에서 API로 보완
         "song_hint": None,
     }
+    if extra_fields:
+        payload.update(extra_fields)
 
-    for url in urls:
+    for url in WEBHOOK_URLS:
         if not url or url.startswith("["):
             logger.warning("Webhook URL이 설정되지 않았습니다: %s", url)
             continue
         try:
             resp = requests.post(url, json=payload, timeout=WEBHOOK_TIMEOUT_SEC)
             resp.raise_for_status()
-            logger.info("Webhook 전송 성공: %s (status=%s)", url, resp.status_code)
+            logger.info("Webhook 전송 성공 [%s]: %s (status=%s)", event_name, url, resp.status_code)
         except requests.exceptions.RequestException as e:
-            logger.error("Webhook 전송 실패: %s (%s)", url, e)
+            logger.error("Webhook 전송 실패 [%s]: %s (%s)", event_name, url, e)
+
+
+class BadgeWatcher:
+    """뱃지 하나(NEW RECORD / MAX COMBO / PERFECT 등)에 대한 감시 상태를 관리합니다."""
+
+    def __init__(self, name: str, config: dict):
+        self.name = name
+        self.config = config
+        self.template_gray = load_template(config["template_path"])
+        self.last_detected_at = 0.0
+        self.last_window_refresh_at = 0.0
+        self.current_region: dict | None = None
+
+    def refresh_region(self, now: float, force: bool) -> bool:
+        """필요 시 창 위치 기준으로 캡처 영역을 갱신합니다. 성공하면 True."""
+        need_refresh = (
+            self.current_region is None
+            or TRACK_WINDOW_EVERY_FRAME
+            or force
+            or (now - self.last_window_refresh_at >= REFRESH_WINDOW_EVERY_SEC)
+        )
+        if not need_refresh:
+            return True
+
+        try:
+            self.current_region = get_window_capture_region(
+                GAME_WINDOW_TITLE,
+                self.config["center_x_frac"],
+                self.config["center_y_frac"],
+                self.config["width_frac"],
+                self.config["height_frac"],
+                self.config.get("margin_frac", 0.0),
+            )
+            self.last_window_refresh_at = now
+            return True
+        except RuntimeError as e:
+            logger.warning("[%s] %s", self.name, e)
+            return False
+
+    def get_current_score(self, sct: mss.mss) -> float:
+        """현재 프레임에서 이 뱃지의 매칭 점수를 반환합니다. (쿨다운과 무관하게 순수 측정)"""
+        if self.current_region is None:
+            return 0.0
+        frame_gray = capture_region(sct, self.current_region)
+        return match_score(frame_gray, self.template_gray)
+
+    def in_cooldown(self, now: float) -> bool:
+        return now - self.last_detected_at < self.config["cooldown_sec"]
+
+    def mark_detected(self, now: float) -> None:
+        self.last_detected_at = now
 
 
 def main() -> None:
-    logger.info("DJMAX NEW RECORD 감시 시작 (Ctrl+C로 종료)")
-    logger.info("대상 창: '%s' / 중심점=(%.4f, %.4f) / w=%.4f h=%.4f (margin=%.4f)",
-                GAME_WINDOW_TITLE, CAPTURE_CENTER_X_FRAC, CAPTURE_CENTER_Y_FRAC,
-                CAPTURE_WIDTH_FRAC, CAPTURE_HEIGHT_FRAC, CAPTURE_MARGIN_FRAC)
-    logger.info("임계값: %.2f / 주기: %.1fs / 쿨다운: %ds",
-                MATCH_THRESHOLD, CHECK_INTERVAL_SEC, COOLDOWN_SEC)
+    logger.info("DJMAX 뱃지 감시 시작 (Ctrl+C로 종료) — 대상 창: '%s'", GAME_WINDOW_TITLE)
 
-    try:
-        template_gray = load_template(TEMPLATE_IMAGE_PATH)
-    except FileNotFoundError as e:
-        logger.error(str(e))
+    watchers: dict[str, BadgeWatcher] = {}
+    for name, config in BADGES.items():
+        try:
+            watchers[name] = BadgeWatcher(name, config)
+            logger.info("[%s] 템플릿 로드 완료: %s", name, config["template_path"])
+        except FileNotFoundError as e:
+            logger.error(str(e))
+
+    if not watchers:
+        logger.error("로드된 뱃지 템플릿이 없습니다. BADGES 설정과 템플릿 파일 경로를 확인하세요.")
         return
-
-    last_detected_at = 0.0
-    last_window_refresh_at = 0.0
-    current_region = None
 
     with mss.mss() as sct:
         while True:
             try:
                 now = time.time()
 
-                # 쿨다운 중이면 캡처/매칭 생략
-                if now - last_detected_at < COOLDOWN_SEC:
-                    time.sleep(CHECK_INTERVAL_SEC)
-                    continue
+                # 1) 모든 뱃지의 캡처 영역을 갱신하고 현재 매칭 점수를 구함
+                current_scores: dict[str, float] = {}
+                for name, watcher in watchers.items():
+                    if not watcher.refresh_region(now, force=False):
+                        continue
+                    current_scores[name] = watcher.get_current_score(sct)
+                    logger.debug("[%s] 유사도=%.3f", name, current_scores[name])
 
-                # 창 위치 갱신 (매 프레임 또는 일정 주기)
-                need_refresh = (
-                    current_region is None
-                    or TRACK_WINDOW_EVERY_FRAME
-                    or (now - last_window_refresh_at >= REFRESH_WINDOW_EVERY_SEC)
-                )
-                if need_refresh:
-                    try:
-                        current_region = get_window_capture_region(
-                            GAME_WINDOW_TITLE,
-                            CAPTURE_CENTER_X_FRAC,
-                            CAPTURE_CENTER_Y_FRAC,
-                            CAPTURE_WIDTH_FRAC,
-                            CAPTURE_HEIGHT_FRAC,
-                            CAPTURE_MARGIN_FRAC,
-                        )
-                        last_window_refresh_at = now
-                    except RuntimeError as e:
-                        logger.warning(str(e))
-                        time.sleep(CHECK_INTERVAL_SEC)
+                # 2) 뱃지별로 임계값 초과 + 쿨다운 아님 이면 이벤트 발생
+                for name, watcher in watchers.items():
+                    if name not in current_scores:
+                        continue
+                    score = current_scores[name]
+                    threshold = watcher.config["threshold"]
+
+                    if score < threshold or watcher.in_cooldown(now):
                         continue
 
-                frame_gray = capture_region(sct, current_region)
-                score = match_score(frame_gray, template_gray)
+                    logger.info("[%s] 감지! (유사도=%.3f)", name, score)
 
-                logger.debug("유사도 점수: %.3f (영역=%s)", score, current_region)
+                    extra_fields = {}
+                    if watcher.config.get("check_companions"):
+                        # 다른 뱃지들이 지금 이 순간 함께 떠 있는지 플래그로 포함
+                        for other_name, other_score in current_scores.items():
+                            if other_name == name:
+                                continue
+                            other_threshold = watchers[other_name].config["threshold"]
+                            extra_fields[other_name] = other_score >= other_threshold
 
-                if score >= MATCH_THRESHOLD:
-                    logger.info("NEW RECORD 감지! (유사도=%.3f)", score)
-                    send_webhooks(WEBHOOK_URLS)
-                    last_detected_at = now
+                    send_webhook(watcher.config["event_name"], extra_fields or None)
+                    watcher.mark_detected(now)
 
             except mss.exception.ScreenShotError as e:
                 logger.error("화면 캡처 실패: %s", e)
