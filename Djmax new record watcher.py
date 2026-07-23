@@ -8,10 +8,18 @@ DJMAX Respect V - 뱃지 감지 → Webhook 트리거 스크립트
   4. 뱃지별로 독립적인 쿨다운을 적용해 중복 감지를 방지
   5. NEW RECORD가 감지된 순간, MAX COMBO/PERFECT 뱃지가 함께 떠 있는지도 확인해서
      그 결과를 new_record_detected 이벤트의 payload에 플래그로 실어 보냄
-  6. Ctrl+C로 종료
+  6. 뱃지 감지 시점에 곡 제목 / 버튼 수 / 패턴을 OCR(Tesseract)로 읽어서
+     webhook payload에 함께 실어 보냄 (Make/n8n에서 V-Archive API 조회 시 사용)
+  7. Ctrl+C로 종료
 
 필요 라이브러리:
-  pip install mss opencv-python requests numpy pygetwindow
+  pip install mss opencv-python requests numpy pygetwindow pytesseract
+
+필요 프로그램:
+  Tesseract-OCR 본체 설치 필요 (pytesseract는 파이썬 바인딩일 뿐, 엔진은 별도 설치)
+  - Windows: https://github.com/UB-Mannheim/tesseract/wiki 에서 설치, 설치 시 "Korean" 언어팩 체크
+  - macOS: brew install tesseract tesseract-lang
+  - Linux: sudo apt install tesseract-ocr tesseract-ocr-kor
 """
 
 import time
@@ -23,6 +31,8 @@ import numpy as np
 import mss
 import requests
 import pygetwindow as gw
+import pytesseract
+import re
 
 # ==========================================================
 # 설정 (여기만 수정하면 됩니다)
@@ -43,14 +53,61 @@ WEBHOOK_TIMEOUT_SEC = 5
 
 # 감지 시 신호를 전송할 Webhook URL들 (Make / n8n 등, 필요한 만큼 추가/삭제 가능)
 WEBHOOK_URLS = [
-    "[Make Webhook URL을 입력하세요]",
+    "[https://hook.eu1.make.com/2l8evmul79dsa8bkt1hrwb3aty65vl7r]",
     "[n8n Webhook URL을 입력하세요]",
 ]
 
 # ----------------------------------------------------------
+# OCR로 읽어올 정보 (곡 제목 / 버튼수 / 패턴)
+# 뱃지가 감지된 "그 순간"에만 OCR을 수행해서 webhook payload에 실어 보냅니다.
+# 아래 기본값은 850x478 기준 캡처에서 측정한 값입니다 (필요시 재측정해서 조정하세요)
+# ----------------------------------------------------------
+
+OCR_REGIONS = {
+    "song_title": {
+        "center_x_frac": 0.5235,
+        "center_y_frac": 0.0272,
+        "width_frac": 0.2706,
+        "height_frac": 0.0293,
+        "margin_frac": 0.01,
+    },
+    "button_count": {
+        "center_x_frac": 0.0706,
+        "center_y_frac": 0.0460,
+        "width_frac": 0.1176,
+        "height_frac": 0.0418,
+        "margin_frac": 0.01,
+    },
+    "pattern": {
+        "center_x_frac": 0.3824,
+        "center_y_frac": 0.0879,
+        "width_frac": 0.0588,
+        "height_frac": 0.0251,
+        "margin_frac": 0.01,
+    },
+}
+
+# Tesseract 실행 파일 경로. 환경변수 PATH에 없으면 직접 지정하세요.
+# 예) Windows: r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+# OCR 언어 (곡 제목에 한글이 섞일 수 있어 eng+kor 권장)
+# 설치 필요: Windows Tesseract 설치 시 "Korean" 언어팩 옵션 체크,
+#            Linux는 `sudo apt install tesseract-ocr-kor`
+OCR_LANG = "eng+kor"
+
+# 패턴 문자열 정규화 매핑 (OCR 오인식 보정용, 필요시 추가)
+PATTERN_ALIASES = {
+    "NM": "NORMAL",
+    "HD": "HARD",
+    "MX": "MAXIMUM",
+    "SC": "SC",
+}
+
+# ----------------------------------------------------------
 # 뱃지별 설정
 # 각 뱃지는 850x478 기준 캡처에서 측정한 "창 크기 대비 비율" 좌표를 사용합니다.
-# 좌표 측정 방식은 draw_region_debug.py(아래 안내 참고)로 검증할 수 있습니다.
 # ----------------------------------------------------------
 
 BADGES = {
@@ -181,13 +238,93 @@ def match_score(frame_gray: np.ndarray, template_gray: np.ndarray) -> float:
     return max_val
 
 
+def ocr_region_text(sct: mss.mss, region: dict, lang: str = OCR_LANG, psm: int = 7) -> str:
+    """지정된 화면 영역을 캡처해 OCR로 텍스트를 추출합니다.
+
+    작은 UI 텍스트는 그대로 넣으면 인식률이 낮아서, 그레이스케일 변환 +
+    3배 업스케일 + 이진화(threshold) 전처리를 거친 뒤 Tesseract에 넘깁니다.
+    """
+    monitor = {
+        "left": region["left"],
+        "top": region["top"],
+        "width": region["width"],
+        "height": region["height"],
+    }
+    shot = sct.grab(monitor)
+    frame = np.array(shot)  # BGRA
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+    upscaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    # 밝은 텍스트 / 어두운 배경이 많은 UI라서 Otsu 이진화 사용
+    _, binary = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    config = f"--psm {psm}"
+    try:
+        text = pytesseract.image_to_string(binary, lang=lang, config=config)
+    except pytesseract.TesseractError as e:
+        logger.warning("OCR 실패: %s", e)
+        return ""
+
+    return text.strip()
+
+
+def parse_button_count(raw_text: str) -> int | None:
+    """OCR로 읽은 텍스트에서 버튼 수(4, 5, 6, 8)를 추출합니다."""
+    match = re.search(r"[4568]", raw_text)
+    if not match:
+        return None
+    return int(match.group())
+
+
+def parse_pattern(raw_text: str) -> str | None:
+    """OCR로 읽은 텍스트에서 패턴 약어(NM/HD/MX/SC)를 추출해 정식 이름으로 변환합니다."""
+    cleaned = raw_text.upper().strip()
+    for abbr, full_name in PATTERN_ALIASES.items():
+        if abbr in cleaned:
+            return full_name
+    return None
+
+
+def extract_song_info(sct: mss.mss, window_title: str) -> dict:
+    """뱃지 감지 시점에 곡 제목 / 버튼 수 / 패턴을 OCR로 읽어 반환합니다.
+
+    창을 찾지 못하거나 OCR이 실패해도 예외를 던지지 않고,
+    읽지 못한 필드는 None으로 채워서 반환합니다 (webhook 전송은 계속 진행).
+    """
+    info = {"song_title": None, "button": None, "pattern": None}
+
+    for field, cfg in OCR_REGIONS.items():
+        try:
+            region = get_window_capture_region(
+                window_title,
+                cfg["center_x_frac"],
+                cfg["center_y_frac"],
+                cfg["width_frac"],
+                cfg["height_frac"],
+                cfg.get("margin_frac", 0.0),
+            )
+        except RuntimeError as e:
+            logger.warning("[OCR:%s] %s", field, e)
+            continue
+
+        raw_text = ocr_region_text(sct, region)
+        logger.debug("[OCR:%s] 원문='%s'", field, raw_text)
+
+        if field == "song_title":
+            info["song_title"] = raw_text or None
+        elif field == "button_count":
+            info["button"] = parse_button_count(raw_text)
+        elif field == "pattern":
+            info["pattern"] = parse_pattern(raw_text)
+
+    return info
+
+
 def send_webhook(event_name: str, extra_fields: dict | None = None) -> None:
     """모든 Webhook URL에 감지 신호를 전송합니다."""
     payload = {
         "event": event_name,
         "detected_at": datetime.now(timezone.utc).isoformat(),
-        # 곡명 자동 인식이 어려우면 생략하고 워크플로우 쪽에서 API로 보완
-        "song_hint": None,
     }
     if extra_fields:
         payload.update(extra_fields)
@@ -295,7 +432,9 @@ def main() -> None:
 
                     logger.info("[%s] 감지! (유사도=%.3f)", name, score)
 
-                    extra_fields = {}
+                    # OCR로 곡 제목 / 버튼 / 패턴 정보를 읽어 payload에 포함
+                    extra_fields = extract_song_info(sct, GAME_WINDOW_TITLE)
+
                     if watcher.config.get("check_companions"):
                         # 다른 뱃지들이 지금 이 순간 함께 떠 있는지 플래그로 포함
                         for other_name, other_score in current_scores.items():
