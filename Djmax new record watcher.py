@@ -20,19 +20,27 @@ import cv2
 import numpy as np
 import mss
 import requests
+import pygetwindow as gw
 
 # ==========================================================
 # 설정 (여기만 수정하면 됩니다)
 # ==========================================================
 
-# 캡처할 화면 영역 [left, top, width, height]
-# 실제 게임 해상도/결과 화면에서 "NEW RECORD" 뱃지가 뜨는 위치로 맞춰야 합니다.
-CAPTURE_REGION = {
-    "left": 0,
-    "top": 0,
-    "width": 400,
-    "height": 200,
-}
+# 창모드 게임 창 제목 (작업 관리자/알트탭에서 보이는 정확한 창 제목으로 맞춰야 합니다)
+GAME_WINDOW_TITLE = "DJMAX RESPECT V"
+
+# "NEW RECORD"가 표시되는 영역을, 게임 창의 좌상단 기준 상대 좌표(오프셋)로 지정
+# 창을 화면 어디로 옮기든 이 오프셋만큼 자동으로 따라갑니다.
+CAPTURE_OFFSET_LEFT = 300
+CAPTURE_OFFSET_TOP = 150
+CAPTURE_WIDTH = 400
+CAPTURE_HEIGHT = 200
+
+# 매 프레임마다 창 위치를 다시 조회할지 여부.
+# True면 창을 옮겨도 항상 정확하지만 약간의 오버헤드가 있습니다.
+# False면 REFRESH_WINDOW_EVERY_SEC 주기로만 갱신합니다.
+TRACK_WINDOW_EVERY_FRAME = True
+REFRESH_WINDOW_EVERY_SEC = 5
 
 # 비교할 템플릿 이미지 경로 ("NEW RECORD" 뱃지/문구를 미리 캡처해서 저장해두세요)
 TEMPLATE_IMAGE_PATH = "new_record_template.png"
@@ -75,6 +83,30 @@ def load_template(path: str) -> np.ndarray:
             "TEMPLATE_IMAGE_PATH 설정을 확인하세요."
         )
     return template
+
+
+def get_window_capture_region(
+    window_title: str,
+    offset_left: int,
+    offset_top: int,
+    width: int,
+    height: int,
+) -> dict:
+    """지정한 제목의 창을 찾아, 창 좌상단 기준 상대 좌표로 캡처 영역을 계산합니다."""
+    windows = gw.getWindowsWithTitle(window_title)
+    if not windows:
+        raise RuntimeError(
+            f"'{window_title}' 창을 찾을 수 없습니다. "
+            "게임이 실행 중인지, GAME_WINDOW_TITLE이 정확한지 확인하세요."
+        )
+
+    win = windows[0]
+    return {
+        "left": win.left + offset_left,
+        "top": win.top + offset_top,
+        "width": width,
+        "height": height,
+    }
 
 
 def capture_region(sct: mss.mss, region: dict) -> np.ndarray:
@@ -129,7 +161,9 @@ def send_webhooks(urls: list[str]) -> None:
 
 def main() -> None:
     logger.info("DJMAX NEW RECORD 감시 시작 (Ctrl+C로 종료)")
-    logger.info("캡처 영역: %s", CAPTURE_REGION)
+    logger.info("대상 창: '%s' / 오프셋: (%d, %d) / 영역 크기: %dx%d",
+                GAME_WINDOW_TITLE, CAPTURE_OFFSET_LEFT, CAPTURE_OFFSET_TOP,
+                CAPTURE_WIDTH, CAPTURE_HEIGHT)
     logger.info("임계값: %.2f / 주기: %.1fs / 쿨다운: %ds",
                 MATCH_THRESHOLD, CHECK_INTERVAL_SEC, COOLDOWN_SEC)
 
@@ -140,6 +174,8 @@ def main() -> None:
         return
 
     last_detected_at = 0.0
+    last_window_refresh_at = 0.0
+    current_region = None
 
     with mss.mss() as sct:
         while True:
@@ -151,10 +187,31 @@ def main() -> None:
                     time.sleep(CHECK_INTERVAL_SEC)
                     continue
 
-                frame_gray = capture_region(sct, CAPTURE_REGION)
+                # 창 위치 갱신 (매 프레임 또는 일정 주기)
+                need_refresh = (
+                    current_region is None
+                    or TRACK_WINDOW_EVERY_FRAME
+                    or (now - last_window_refresh_at >= REFRESH_WINDOW_EVERY_SEC)
+                )
+                if need_refresh:
+                    try:
+                        current_region = get_window_capture_region(
+                            GAME_WINDOW_TITLE,
+                            CAPTURE_OFFSET_LEFT,
+                            CAPTURE_OFFSET_TOP,
+                            CAPTURE_WIDTH,
+                            CAPTURE_HEIGHT,
+                        )
+                        last_window_refresh_at = now
+                    except RuntimeError as e:
+                        logger.warning(str(e))
+                        time.sleep(CHECK_INTERVAL_SEC)
+                        continue
+
+                frame_gray = capture_region(sct, current_region)
                 score = match_score(frame_gray, template_gray)
 
-                logger.debug("유사도 점수: %.3f", score)
+                logger.debug("유사도 점수: %.3f (영역=%s)", score, current_region)
 
                 if score >= MATCH_THRESHOLD:
                     logger.info("NEW RECORD 감지! (유사도=%.3f)", score)
